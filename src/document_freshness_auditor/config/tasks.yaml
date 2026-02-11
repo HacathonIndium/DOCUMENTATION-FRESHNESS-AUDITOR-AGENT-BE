@@ -1,0 +1,39 @@
+audit_task:
+  description: >
+    Audit the documentation in the project at {project_path}.
+    Steps:
+    1. FIRST, use the 'List Files Tool' to see all files in {project_path}.
+    2. Then, for each relevant Python file, use 'Docstring Signature Auditor' to check docstrings.
+    3. Use 'README Structure Auditor' to check mentions in README.
+    4. Use 'API Implementation Auditor' if routes are detected.
+    5. Use 'Code Comment Auditor' to extract context.
+  expected_output: >
+    A detailed audit report of all discrepancies found, grouped by file path.
+  agent: documentation_auditor
+
+analysis_task:
+  description: >
+    Review the audit findings for the files at {project_path}.
+    For EVERY file audited, you MUST provide:
+    - Freshness score (0-100%): 100% means perfect sync, 0% means missing docs.
+    - Severity (Critical/Major/Minor/None).
+    - Confidence level (High/Medium/Low).
+    
+    You MUST output a Markdown table called 'File-by-File Scorecard' with these columns: 
+    | File Name | Location | Freshness Score (%) | Severity | Confidence Level |
+  expected_output: >
+    A structured analysis with scores and severity ratings, including the mandatory 'File-by-File Scorecard' table.
+  agent: freshness_analyst
+
+suggestion_task:
+  description: >
+    Generate suggested fixes for all identified stale documentation at {project_path}.
+    The final report MUST include:
+    1. Executive Summary.
+    2. The 'File-by-File Scorecard' table from the analysis.
+    3. Detailed 'File-by-File Analysis' section with diffs or clear instructions.
+    4. Recommendations.
+  expected_output: >
+    A final markdown report titled 'Documentation Freshness Audit Report' with all required sections and the populated scorecard table.
+  agent: fix_suggester
+  human_input: true

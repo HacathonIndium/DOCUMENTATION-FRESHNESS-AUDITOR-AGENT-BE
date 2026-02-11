@@ -1,0 +1,25 @@
+[project]
+name = "document_freshness_auditor"
+version = "0.1.0"
+description = "Document-Freshness-auditor using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai[tools]==1.9.2",
+    "python-dotenv"
+]
+
+[project.scripts]
+document_freshness_auditor = "document_freshness_auditor.main:run"
+run_crew = "document_freshness_auditor.main:run"
+train = "document_freshness_auditor.main:train"
+replay = "document_freshness_auditor.main:replay"
+test = "document_freshness_auditor.main:test"
+run_with_trigger = "document_freshness_auditor.main:run_with_trigger"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "crew"
