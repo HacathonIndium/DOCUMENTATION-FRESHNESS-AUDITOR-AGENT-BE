@@ -10,6 +10,7 @@ from document_freshness_auditor.tools.doc_tools import (
     CodeCommentTool,
     ListFilesTool
 )
+from document_freshness_auditor.tools.freshness_scorer import freshness_scorer
 
 @CrewBase
 class DocumentFreshnessAuditor():
@@ -40,11 +41,12 @@ class DocumentFreshnessAuditor():
         )
 
     @agent
-    def freshness_analyst(self) -> Agent:
+    def freshness_scorer(self) -> Agent:
         return Agent(
-            config=self.agents_config['freshness_analyst'],
+            config=self.agents_config['freshness_scorer'],
             llm=self.llm,
-            verbose=True
+            verbose=True,
+            tools=[freshness_scorer]
         )
 
     @agent
@@ -62,9 +64,9 @@ class DocumentFreshnessAuditor():
         )
 
     @task
-    def analysis_task(self) -> Task:
+    def freshness_scorer_task(self) -> Task:
         return Task(
-            config=self.tasks_config['analysis_task'],
+            config=self.tasks_config['freshness_scorer_task'],
         )
 
     @task

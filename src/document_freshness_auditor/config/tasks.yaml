@@ -11,19 +11,189 @@ audit_task:
     A detailed audit report of all discrepancies found, grouped by file path.
   agent: documentation_auditor
 
-analysis_task:
+
+freshness_scorer_task:
   description: >
-    Review the audit findings for the files at {project_path}.
-    For EVERY file audited, you MUST provide:
-    - Freshness score (0-100%): 100% means perfect sync, 0% means missing docs.
-    - Severity (Critical/Major/Minor/None).
-    - Confidence level (High/Medium/Low).
-    
-    You MUST output a Markdown table called 'File-by-File Scorecard' with these columns: 
-    | File Name | Location | Freshness Score (%) | Severity | Confidence Level |
+    Given the comparison data from the Code & Documentation Analyzer, score each 
+        file's documentation freshness ,classify severity and confidence.
+       
+        YOUR TASKS:
+        
+        1.Parse Analyzer Output: Extract all comparison data for each file
+        
+        2.Evaluate Scoring Components(assign values 0-1 for each):
+        
+           A. FRESHNESS FACTORS:
+           - structural_match: Do parameters, return types, and endpoints align?
+             * 1.0 = Perfect match
+             * 0.5 = Some mismatches
+             * 0.0 = Major structural differences
+           
+           - semantic_accuracy: Does documentation describe actual behavior?
+             * 1.0 = Description perfectly matches implementation
+             * 0.5 = Partially accurate, some outdated info
+             * 0.0 = Description completely wrong
+           
+           - recency_factor: How recent is the documentation vs code?
+             * 1.0 = Updated within days of code change
+             * 0.5 = Updated within months
+             * 0.0 = Not updated in 6+ months after code change
+           
+           - completeness: Are all code elements documented?
+             * 1.0 = All functions/classes/methods documented
+             * 0.5 = 50% documented
+             * 0.0 = Minimal or no documentation
+        
+           B. CONFIDENCE FACTORS:
+           - mismatch_clarity: How obvious are the discrepancies?
+             * 1.0 = Clear, objective mismatch (e.g., param count difference)
+             * 0.5 = Requires some interpretation
+             * 0.0 = Highly subjective or unclear
+           
+           - code_complexity: How complex is the code?
+             * 1.0 = Very complex, hard to understand
+             * 0.5 = Moderate complexity
+             * 0.0 = Simple, straightforward
+           
+           - doc_structure_quality: How well-structured is the documentation?
+             * 1.0 = Well-structured, easy to parse
+             * 0.5 = Acceptable structure
+             * 0.0 = Poor or no structure
+        
+        3.Use freshness_scorer Tool: Call the tool with all 7 parameters to get:
+           - freshness_score (0-100)
+           - severity (critical/major/minor)
+           - confidence (0-1)
+           - detailed breakdown
+        
+        4.Document Specific Issues: For each file, list problems with:
+           - Clear description of the issue
+           - Location (line number or section)
+           - Expected value (what code shows)
+           - Actual value (what doc says)
+           - Impact explanation (why this matters)
+        
+        5.Provide Recommendations: Actionable steps to improve documentation freshness
+        
+          SCORING INTERPRETATION:
+        
+          Freshness Score:
+            - < 50% → CRITICAL: Immediate attention required, documentation unusable
+            - 50-74% → MAJOR: Should be addressed soon, significant issues
+            - >= 75% → MINOR: Low priority, minor improvements needed
+        
+          Confidence Level:
+            - > 0.8 → HIGH: Very certain about the assessment
+            - 0.5-0.8 → MEDIUM: Reasonably confident
+            - < 0.5 → LOW: Requires manual review
+        
+        EXAMPLES:
+        
+        Example 1 - Clear Parameter Mismatch:
+        ```
+        freshness_scorer(
+            structural_match=0.25,      # 1 of 4 params documented
+            semantic_accuracy=0.70,     # Description mostly accurate
+            recency_factor=0.30,        # 6 months outdated
+            completeness=0.60,          # 3 of 5 methods documented
+            mismatch_clarity=0.95,      # Very clear param count difference
+            code_complexity=0.40,       # Moderate complexity
+            doc_structure_quality=0.80  # Well-structured docs
+        )
+        → Score: ~42% (critical), Confidence: 0.82 (high)
+        ```
+        
+        Example 2 - Semantic Drift:
+        ```
+        freshness_scorer(
+            structural_match=0.90,      # Structure looks good
+            semantic_accuracy=0.40,     # Behavior changed, docs didn't
+            recency_factor=0.20,        # Very outdated
+            completeness=0.85,          # Well documented
+            mismatch_clarity=0.45,      # Requires interpretation
+            code_complexity=0.70,       # Complex code
+            doc_structure_quality=0.75  # Good structure
+        )
+        → Score: ~61% (major), Confidence: 0.48 (low - needs review)
+        ```
+        
+        **OUTPUT REQUIREMENTS:**
+        Produce a comprehensive JSON report for each file analyzed.
   expected_output: >
-    A structured analysis with scores and severity ratings, including the mandatory 'File-by-File Scorecard' table.
-  agent: freshness_analyst
+    A JSON array containing detailed freshness assessments for each file:
+       
+       [
+         {
+           "file_path": "src/api/user_service.py",
+           "doc_type": "inline_docstring",
+           "freshness_score": 45.5,
+           "severity": "critical",
+           "confidence": 0.92,
+           "score_breakdown": {
+             "structural_match": 0.30,
+             "semantic_accuracy": 0.50,
+             "recency_factor": 0.60,
+             "completeness": 0.40
+           },
+           "confidence_factors": {
+             "mismatch_clarity": 0.95,
+             "code_complexity": 0.40,
+             "doc_structure_quality": 0.80
+           },
+           "issues": [
+             {
+               "description": "Parameter mismatch in create_user method",
+               "location": "line 45, create_user() docstring",
+               "expected": "4 parameters: username, email, password, role",
+               "actual": "2 parameters: username, email",
+               "impact": "Developers will be unaware of required 'password' and 'role' parameters, leading to incorrect API usage"
+             },
+             {
+               "description": "Return type documentation outdated",
+               "location": "line 52",
+               "expected": "Returns: Dict[str, Any] with user_id, timestamp, status",
+               "actual": "Returns: int (user_id only)",
+               "impact": "Consumers expecting only user_id will break when accessing timestamp/status fields"
+             }
+           ],
+           
+         },
+         {
+           "file_path": "src/utils/validators.py",
+           "doc_type": "inline_docstring",
+           "freshness_score": 82.3,
+           "severity": "minor",
+           "confidence": 0.88,
+           "score_breakdown": {
+             "structural_match": 0.90,
+             "semantic_accuracy": 0.85,
+             "recency_factor": 0.70,
+             "completeness": 0.80
+           },
+           "confidence_factors": {
+             "mismatch_clarity": 0.85,
+             "code_complexity": 0.25,
+             "doc_structure_quality": 0.90
+           },
+           "issues": [
+             {
+               "description": "Minor example outdated in validate_email()",
+               "location": "line 23, docstring example",
+               "expected": "Example should show new domain validation",
+               "actual": "Example uses old validation pattern",
+               "impact": "Low - developers may use outdated pattern in examples"
+             }
+           ],
+           
+         }
+       ]
+       
+       Include all files from analyzer output with complete scoring details.
+
+  agent: freshness_scorer
+  context:
+    - audit_task
+
 
 suggestion_task:
   description: >
