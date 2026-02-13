@@ -121,6 +121,24 @@ def _parse_analysis(analysis_json_str: str) -> dict:
             })
 
         recommendations = entry.get("recommendations", []) or []
+        # Normalize recommendations into a list so the API/clients always
+        # receive a consistent type. The analyzer sometimes returns a
+        # single string or a JSON-encoded string.
+        if isinstance(recommendations, str):
+            # strip surrounding whitespace and JSON fences if present
+            rec_raw = recommendations.strip()
+            # try to decode JSON arrays encoded as strings
+            if rec_raw.startswith("[") and rec_raw.endswith("]"):
+                try:
+                    parsed_rec = json.loads(rec_raw)
+                    recommendations = parsed_rec if isinstance(parsed_rec, list) else [str(parsed_rec)]
+                except Exception:
+                    recommendations = [rec_raw]
+            else:
+                recommendations = [rec_raw]
+        elif not isinstance(recommendations, list):
+            # fallback: coerce other types into an empty list
+            recommendations = []
 
         files.append({
             "file": entry.get("file_path", ""),
