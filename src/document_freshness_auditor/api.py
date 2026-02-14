@@ -1,11 +1,11 @@
 import os
 import warnings
+import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -15,13 +15,15 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 
 from document_freshness_auditor.crew import DocumentFreshnessAuditor
 from document_freshness_auditor import db
+from document_freshness_auditor import hitl
 
 
-# ── lifespan ─────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    hitl.install()
     yield
+    hitl.uninstall()
 
 
 app = FastAPI(
@@ -38,17 +40,17 @@ app.add_middleware(
 )
 
 
-# ── schemas ──────────────────────────────────────────────────────
-
 class AnalyzeRequest(BaseModel):
     project_name: str = Field(..., min_length=1, description="Human-readable project name")
     project_path: str = Field(..., min_length=1, description="Absolute path to the project directory")
 
 
-class AnalyzeContinueRequest(BaseModel):
-    report_id: str = Field(..., min_length=1)
-    user_input: str = Field(..., min_length=1)
-    apply: bool = Field(False, description="If true, apply fixes to files; otherwise return preview only")
+class HITLFeedbackRequest(BaseModel):
+    report_id: str = Field(..., min_length=1, description="The report_id returned by /analyze/start")
+    feedback: str = Field(
+        "",
+        description="Human feedback text. Empty string = approve as-is.",
+    )
 
 
 class ProjectOut(BaseModel):
@@ -58,7 +60,6 @@ class ProjectOut(BaseModel):
     created_at: str
 
 
-# History list item — matches the UI card shape
 class AuditHistoryOut(BaseModel):
     id: str
     project_name: str
@@ -72,7 +73,6 @@ class AuditHistoryOut(BaseModel):
     severity: str
 
 
-# Full report shapes
 class IssueSummary(BaseModel):
     total_files: int
     critical_issues: int
@@ -120,225 +120,146 @@ class FullReportOut(BaseModel):
     files: list[FileReportOut] = []
 
 
-class ReportCreatedOut(BaseModel):
-    id: str
-    project_id: str
-    status: str
-    total_files: int
-    critical_issues: int
-    major_issues: int
-    minor_issues: int
-    average_score: float
-    severity: str
-    created_at: str
-
-
-def _extract_outputs(result) -> tuple[str, str]:
+def grab_outputs(result):
     analysis_json = ""
     audit_raw = ""
     if hasattr(result, "tasks_output") and result.tasks_output:
         for task_out in result.tasks_output:
-            task_name = (getattr(task_out, "name", "") or "").lower()
+            name = (getattr(task_out, "name", "") or "").lower()
             raw = getattr(task_out, "raw", "") or ""
-            # Primary analysis (freshness/scorer) outputs
-            if "scorer" in task_name or "freshness" in task_name:
+            if "scorer" in name or "freshness" in name:
                 analysis_json = raw
-            # Suggestion/fix tasks may emit recommendations; capture them too
-            elif any(k in task_name for k in ("suggest", "suggestion", "fix", "recommend", "fixer")):
-                # prefer scorer output, but fall back to suggestion raw if present
+            elif any(k in name for k in ("suggest", "suggestion", "fix", "recommend", "fixer")):
                 if not analysis_json and raw:
                     analysis_json = raw
-            elif "audit" in task_name:
+            elif "audit" in name:
                 audit_raw = raw
     return analysis_json, audit_raw
 
 
-# ── endpoints ────────────────────────────────────────────────────
+def run_crew_background(report_id, project_path):
+    try:
+        hitl.link_report(report_id)
+        auditor = DocumentFreshnessAuditor()
 
-@app.post("/analyze", response_model=ReportCreatedOut, status_code=201)
-def analyze_project(req: AnalyzeRequest):
-    """
-    Kick off a full documentation freshness audit.
-    Creates a project record, runs the crew, parses & stores everything.
-    """
-    if not os.path.isdir(req.project_path):
-        raise HTTPException(status_code=400, detail=f"Directory not found: {req.project_path}")
+        result = auditor.hitl_crew().kickoff(
+            inputs={
+                "project_path": project_path,
+                "current_year": str(datetime.now().year),
+            }
+        )
 
-    project = db.create_project(name=req.project_name, path=req.project_path)
+        analysis_json, audit_raw = grab_outputs(result)
 
-    inputs = {
-        "project_path": req.project_path,
-        "current_year": str(datetime.now().year),
-    }
+        report_md = ""
+        report_file = os.path.join(os.getcwd(), "freshness_audit_report.md")
+        if os.path.exists(report_file):
+            with open(report_file, "r") as f:
+                report_md = f.read()
 
-    crew_instance = DocumentFreshnessAuditor()
-    result = crew_instance.crew().kickoff(inputs=inputs)
+        db.finalize_report(report_id, report_md, analysis_json, audit_raw)
+        print(f"[API] crew finished for report {report_id}")
 
-    report_md = ""
-    report_file = os.path.join(os.getcwd(), "freshness_audit_report.md")
-    if os.path.exists(report_file):
-        with open(report_file, "r") as f:
-            report_md = f.read()
-
-    analysis_json = ""
-    audit_raw = ""
-    if hasattr(result, "tasks_output") and result.tasks_output:
-        for task_out in result.tasks_output:
-            task_name = getattr(task_out, "name", "") or ""
-            raw = getattr(task_out, "raw", "") or ""
-            if "scorer" in task_name.lower() or "freshness" in task_name.lower():
-                analysis_json = raw
-            elif "audit" in task_name.lower():
-                audit_raw = raw
-
-    report = db.create_report(
-        project_id=project["id"],
-        report_md=report_md,
-        analysis_json=analysis_json,
-        audit_raw=audit_raw,
-    )
-
-    return ReportCreatedOut(**report)
-
-
-@app.get("/hitl", response_class=HTMLResponse)
-def hitl_page():
-    return """
-<!doctype html>
-<html>
-  <body style=\"font-family:Arial;max-width:840px;margin:20px auto\">
-    <h2>Documentation Audit HITL</h2>
-    <p>Step 1: Run <code>POST /analyze/start</code> and copy report_id.</p>
-    <p>Step 2: Paste report_id + your feedback and submit.</p>
-    <input id=\"report_id\" placeholder=\"report_id\" style=\"width:100%;padding:8px;margin-bottom:8px;\" />
-    <textarea id=\"user_input\" rows=\"8\" style=\"width:100%;padding:8px;\" placeholder=\"Approve / corrections / extra guidance\"></textarea>
-    <br/><br/>
-        <label style="display:block;margin-top:8px"><input type="checkbox" id="apply"> Apply fixes to files</label>
-        <button onclick="go()">Submit Human Input</button>
-    <pre id=\"out\" style=\"background:#f4f4f4;padding:12px;\"></pre>
-    <script>
-      async function go() {
-        const payload = {
-          report_id: document.getElementById(\"report_id\").value,
-          user_input: document.getElementById(\"user_input\").value
-                ,
-                    apply: document.getElementById("apply").checked
-                };
-        const r = await fetch(\"/analyze/continue\", {
-          method: \"POST\",
-          headers: {\"Content-Type\":\"application/json\"},
-          body: JSON.stringify(payload)
-        });
-        document.getElementById(\"out\").textContent = await r.text();
-      }
-    </script>
-  </body>
-</html>
-"""
+    except Exception as e:
+        print(f"[API] crew failed for report {report_id}: {e}")
+        db.set_status(report_id, "failed")
+    finally:
+        hitl.remove(report_id)
 
 
 @app.post("/analyze/start")
-def analyze_start(req: AnalyzeRequest):
+def start_audit(req: AnalyzeRequest):
     if not os.path.isdir(req.project_path):
         raise HTTPException(status_code=400, detail=f"Directory not found: {req.project_path}")
 
     project = db.create_project(name=req.project_name, path=req.project_path)
-    crew_instance = DocumentFreshnessAuditor()
+    report = db.create_hitl_report(project_id=project["id"])
 
-    result = crew_instance.analysis_only_crew().kickoff(
-        inputs={
-            "project_path": req.project_path,
-            "current_year": str(datetime.now().year),
-        }
+    t = threading.Thread(
+        target=run_crew_background,
+        args=(report["id"], req.project_path),
+        daemon=True,
     )
+    t.start()
 
-    analysis_json, audit_raw = _extract_outputs(result)
-    report = db.create_pending_report(
-        project_id=project["id"],
-        analysis_json=analysis_json,
-        audit_raw=audit_raw,
-    )
-
-    preview = db.get_full_report(report["id"])
     return {
         "report_id": report["id"],
         "project_id": project["id"],
-        "status": report["status"],
-        "preview": preview,
+        "status": "processing",
+        "message": "Audit started. Poll GET /hitl/status/{report_id} for progress.",
     }
 
 
-@app.post("/analyze/continue")
-def analyze_continue(req: AnalyzeContinueRequest):
+@app.get("/hitl/status/{report_id}")
+def check_status(report_id: str):
+    report = db.get_report(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    resp: dict[str, Any] = {
+        "report_id": report_id,
+        "status": report["status"],
+    }
+
+    if report["status"] == "pending_human_input":
+        resp["agent_output"] = report.get("agent_output", "")
+        resp["message"] = (
+            "The fix_suggester agent has produced a draft. "
+            "Review agent_output and POST /hitl/feedback with your feedback "
+            "(or empty string to approve as-is)."
+        )
+    elif report["status"] == "processing":
+        resp["message"] = "Crew is still running. Please poll again."
+    elif report["status"] == "completed":
+        resp["message"] = "Audit complete. Fetch full report at GET /reports/{report_id}."
+    elif report["status"] == "failed":
+        resp["message"] = "Crew run failed. Check server logs."
+
+    return resp
+
+
+@app.post("/hitl/feedback")
+def give_feedback(req: HITLFeedbackRequest):
     report = db.get_report(req.report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    project = db.get_project(report["project_id"])
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    if report["status"] != "pending_human_input":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Report is not awaiting feedback (current status: {report['status']})",
+        )
 
-    # If the client only wants a preview (default), return the preview without applying fixes.
-    if not req.apply:
-        preview = db.get_full_report(req.report_id)
-        return {
-            "report_id": req.report_id,
-            "status": report["status"],
-            "preview": preview,
-            "message": "Preview generated. Set 'apply' to true to apply fixes."
-        }
+    ok = hitl.send_feedback(req.report_id, req.feedback)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail="No pending HITL request found for this report (may have timed out).",
+        )
 
-    # Apply fixes via the fix-only crew when explicitly requested.
-    crew_instance = DocumentFreshnessAuditor()
-    crew_instance.fix_only_crew().kickoff(
-        inputs={
-            "project_path": project["path"],
-            "current_year": str(datetime.now().year),
-            "scored_issues": report.get("_parsed", {}).get("files", []),
-            "user_feedback": req.user_input,
-        }
-    )
-
-    report_file = os.path.join(os.getcwd(), "freshness_audit_report.md")
-    report_md = ""
-    if os.path.exists(report_file):
-        with open(report_file, "r") as f:
-            report_md = f.read()
-
-    final_row = db.finalize_report(req.report_id, report_md)
-    if not final_row:
-        raise HTTPException(status_code=500, detail="Could not finalize report")
-
+    action = "approved as-is" if req.feedback.strip() == "" else "feedback submitted"
     return {
-        "report_id": final_row["id"],
-        "status": final_row["status"],
-        "message": "HITL accepted. Fix report generated.",
+        "report_id": req.report_id,
+        "status": "processing",
+        "message": f"Human feedback {action}. Crew is resuming.",
     }
 
 
-# ── Audit History (list view for UI) ─────────────────────────────
-
 @app.get("/history", response_model=list[AuditHistoryOut])
-def get_audit_history():
-    """Returns all past audits in the shape the UI history list expects."""
+def get_history():
     return db.get_audit_history()
 
 
-# ── Full report (detail view for UI) ─────────────────────────────
-
 @app.get("/reports/{report_id}", response_model=FullReportOut)
-def get_full_report(report_id: str):
-    """Returns the full structured report matching the UI detail view."""
+def get_report(report_id: str):
     r = db.get_full_report(report_id)
     if not r:
         raise HTTPException(status_code=404, detail="Report not found")
     return r
 
 
-# ── Projects ─────────────────────────────────────────────────────
-
 @app.get("/projects", response_model=list[ProjectOut])
-def list_projects():
+def get_projects():
     return db.list_projects()
 
 
@@ -352,7 +273,6 @@ def get_project(project_id: str):
 
 @app.get("/projects/find")
 def find_project(name: str, path: str):
-    """Find a project by both name and path and return its id."""
     p = db.get_project_by_name_path(name, path)
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -360,12 +280,11 @@ def find_project(name: str, path: str):
 
 
 @app.get("/projects/{project_id}/reports", response_model=list[AuditHistoryOut])
-def list_project_reports(project_id: str):
+def get_project_reports(project_id: str):
     p = db.get_project(project_id)
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
     rows = db.list_reports_for_project(project_id)
-    # enrich with project name for consistency
     name = p["name"]
     return [
         AuditHistoryOut(
@@ -384,9 +303,15 @@ def list_project_reports(project_id: str):
     ]
 
 
-# ── runner ───────────────────────────────────────────────────────
 def serve():
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("document_freshness_auditor.api:app", host=host, port=port, reload=True)
+    reload = os.getenv("RELOAD", "false").lower() in ("1", "true", "yes")
+    uvicorn.run(
+        "document_freshness_auditor.api:app",
+        host=host,
+        port=port,
+        reload=reload,
+        reload_excludes=["**/demo-project/**"] if reload else None,
+    )

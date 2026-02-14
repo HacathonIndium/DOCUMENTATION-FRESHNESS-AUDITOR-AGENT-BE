@@ -199,18 +199,55 @@ freshness_scorer_task:
 
 suggestion_task:
   description: >
-    For EACH file with issues, you MUST:
-    1. Call 'read_file' with the absolute file path to get the current content.
-    2. Generate the corrected full file content (with documentation fixed).
-    3. Call 'diff_generator' with old_text=<current content>, new_text=<corrected content> to show changes.
-    4. Call 'apply_fix' with file_path=<absolute path> and new_content=<corrected content> to WRITE the fix.
+    You are fixing documentation files in {project_path}.
+
+    PHASE 1 — FIX FILES (use tools):
+    For EACH file with issues:
+      1. Call 'read_file' with the absolute file path to get the current content.
+      2. Generate the corrected full file content (with documentation fixed).
+      3. Call 'diff_generator' with old_text=<current content>, new_text=<corrected content>.
+      4. Call 'apply_fix' with file_path=<absolute path> and new_content=<corrected content> to WRITE the fix.
     Repeat steps 1-4 for EVERY file that has issues.
-    After all files are fixed, produce a final markdown report titled 'Documentation Freshness Audit Report' with:
-    - Executive Summary
-    - File-by-File Scorecard table
-    - Detailed File-by-File Analysis with diffs
-    - Recommendations
+
+    PHASE 2 — PRODUCE FINAL REPORT:
+    After ALL files are fixed, your Final Answer MUST be a clean Markdown report
+    with EXACTLY this structure:
+
+    # Documentation Freshness Audit Report
+
+    ## Executive Summary
+    (Brief paragraph: project name, number of files analyzed, key findings, actions taken.)
+
+    ## File-by-File Scorecard
+    | File Path | Initial Score | Final Score | Status |
+    | :--- | :---: | :---: | :--- |
+    | path/to/file | 45% | 100% | FIXED |
+    (One row per file.)
+
+    ## Detailed File-by-File Analysis
+    For each file:
+    ### path/to/file
+    - **Issues found:** (brief list)
+    - **Fix applied:** (what was changed)
+    - **Diff:**
+    ```diff
+    (unified diff showing ONLY the changed lines, NOT the entire file)
+    ```
+
+    ## Recommendations
+    (Numbered list of actionable recommendations.)
+
+    CRITICAL RULES FOR YOUR FINAL ANSWER:
+    - Output ONLY the Markdown report described above.
+    - Do NOT include full file contents — show only diffs of changes.
+    - Do NOT repeat these instructions or reference them in any way.
+    - Do NOT invent custom titles, wrappers, or preambles.
+    - Do NOT include meta-commentary like "BEGIN FINAL ANSWER" or "THE ACTUAL FULL FILE CONTENTS".
+    - The report title MUST be exactly "# Documentation Freshness Audit Report".
   expected_output: >
-    A final markdown report AND all documentation files in {project_path} must be updated in-place using apply_fix.
+    A clean Markdown report titled "# Documentation Freshness Audit Report" containing:
+    an executive summary, a file-by-file scorecard table, detailed analysis with
+    unified diffs (NOT full file contents), and recommendations.
+    All documentation files in {project_path} must also have been updated in-place using apply_fix.
   agent: fix_suggester
   human_input: true

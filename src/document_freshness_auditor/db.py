@@ -6,11 +6,11 @@ import os
 from datetime import datetime, timezone
 
 
-DB_PATH = os.getenv("FRESHNESS_DB_PATH", "freshness_auditor.db")
+DB_FILE = os.getenv("FRESHNESS_DB_PATH", "freshness_auditor.db")
 
 
-def _connect():
-    conn = sqlite3.connect(DB_PATH)
+def get_conn():
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -18,7 +18,7 @@ def _connect():
 
 
 def init_db():
-    conn = _connect()
+    conn = get_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
             id          TEXT PRIMARY KEY,
@@ -40,19 +40,21 @@ def init_db():
             report_md       TEXT,
             analysis_json   TEXT,
             audit_raw       TEXT,
+            agent_output    TEXT DEFAULT '',
             created_at      TEXT NOT NULL,
             FOREIGN KEY (project_id) REFERENCES projects(id)
         );
     """)
+    try:
+        conn.execute("SELECT agent_output FROM reports LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE reports ADD COLUMN agent_output TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
 
-# ── analysis parser ──────────────────────────────────────────────
-
-def _parse_analysis(analysis_json_str: str) -> dict:
-    """Parse the raw analysis JSON string and compute summary stats."""
-    defaults = {
+def parse_analysis(raw_str):
+    empty = {
         "total_files": 0,
         "critical_issues": 0,
         "major_issues": 0,
@@ -62,57 +64,53 @@ def _parse_analysis(analysis_json_str: str) -> dict:
         "files": [],
     }
 
-    if not analysis_json_str or not analysis_json_str.strip():
-        return defaults
+    if not raw_str or not raw_str.strip():
+        return empty
 
-    raw = analysis_json_str.strip()
+    text = raw_str.strip()
 
-    # try to pull a JSON array out of the raw string
     data = None
     try:
-        data = json.loads(raw)
+        data = json.loads(text)
     except json.JSONDecodeError:
-        # sometimes the LLM wraps JSON in markdown fences
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if m:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
             try:
-                data = json.loads(m.group())
+                data = json.loads(match.group())
             except json.JSONDecodeError:
                 pass
 
     if not isinstance(data, list):
-        return defaults
+        return empty
 
-    total_files = len(data)
-    critical = 0
+    total = len(data)
+    crit = 0
     major = 0
     minor = 0
-    score_sum = 0.0
+    score_total = 0.0
     files = []
 
-    for entry in data:
-        if not isinstance(entry, dict):
+    for item in data:
+        if not isinstance(item, dict):
             continue
 
-        sev = str(entry.get("severity", "minor")).lower()
-        file_issues = entry.get("issues", []) or []
+        sev = str(item.get("severity", "minor")).lower()
+        issues = item.get("issues", []) or []
 
-        # count issues by severity at the file level
         if sev == "critical":
-            critical += len(file_issues) if file_issues else 1
+            crit += len(issues) if issues else 1
         elif sev == "major":
-            major += len(file_issues) if file_issues else 1
+            major += len(issues) if issues else 1
         else:
-            minor += len(file_issues) if file_issues else 1
+            minor += len(issues) if issues else 1
 
-        fs = float(entry.get("freshness_score", 0))
-        score_sum += fs
+        score = float(item.get("freshness_score", 0))
+        score_total += score
 
-        # build the per-file object the UI expects
-        numbered_issues = []
-        for idx, iss in enumerate(file_issues, 1):
-            numbered_issues.append({
-                "number": idx,
+        numbered = []
+        for i, iss in enumerate(issues, 1):
+            numbered.append({
+                "number": i,
                 "issue": iss.get("description", ""),
                 "location": iss.get("location", ""),
                 "impact": iss.get("impact", ""),
@@ -120,41 +118,34 @@ def _parse_analysis(analysis_json_str: str) -> dict:
                 "actual": iss.get("actual", ""),
             })
 
-        recommendations = entry.get("recommendations", []) or []
-        # Normalize recommendations into a list so the API/clients always
-        # receive a consistent type. The analyzer sometimes returns a
-        # single string or a JSON-encoded string.
-        if isinstance(recommendations, str):
-            # strip surrounding whitespace and JSON fences if present
-            rec_raw = recommendations.strip()
-            # try to decode JSON arrays encoded as strings
-            if rec_raw.startswith("[") and rec_raw.endswith("]"):
+        recs = item.get("recommendations", []) or []
+        if isinstance(recs, str):
+            recs = recs.strip()
+            if recs.startswith("[") and recs.endswith("]"):
                 try:
-                    parsed_rec = json.loads(rec_raw)
-                    recommendations = parsed_rec if isinstance(parsed_rec, list) else [str(parsed_rec)]
+                    parsed = json.loads(recs)
+                    recs = parsed if isinstance(parsed, list) else [str(parsed)]
                 except Exception:
-                    recommendations = [rec_raw]
+                    recs = [recs]
             else:
-                recommendations = [rec_raw]
-        elif not isinstance(recommendations, list):
-            # fallback: coerce other types into an empty list
-            recommendations = []
+                recs = [recs]
+        elif not isinstance(recs, list):
+            recs = []
 
         files.append({
-            "file": entry.get("file_path", ""),
-            "doc_type": entry.get("doc_type", ""),
+            "file": item.get("file_path", ""),
+            "doc_type": item.get("doc_type", ""),
             "severity": sev,
-            "freshness_score": fs,
-            "confidence": float(entry.get("confidence", 0)),
-            "score_breakdown": entry.get("score_breakdown", {}),
-            "issues": numbered_issues,
-            "recommendations": recommendations,
+            "freshness_score": score,
+            "confidence": float(item.get("confidence", 0)),
+            "score_breakdown": item.get("score_breakdown", {}),
+            "issues": numbered,
+            "recommendations": recs,
         })
 
-    avg = round(score_sum / total_files, 2) if total_files else 0.0
+    avg = round(score_total / total, 2) if total else 0.0
 
-    # overall severity = whichever bucket has the most issues
-    if critical >= major and critical >= minor:
+    if crit >= major and crit >= minor:
         overall = "critical"
     elif major >= minor:
         overall = "major"
@@ -162,8 +153,8 @@ def _parse_analysis(analysis_json_str: str) -> dict:
         overall = "minor"
 
     return {
-        "total_files": total_files,
-        "critical_issues": critical,
+        "total_files": total,
+        "critical_issues": crit,
         "major_issues": major,
         "minor_issues": minor,
         "average_score": avg,
@@ -172,48 +163,43 @@ def _parse_analysis(analysis_json_str: str) -> dict:
     }
 
 
-# ── project helpers ──────────────────────────────────────────────
-
-def create_project(name: str, path: str) -> dict:
-    # If a project with the same name AND path already exists, return it.
-    conn = _connect()
+def create_project(name, path):
+    conn = get_conn()
     row = conn.execute(
         "SELECT * FROM projects WHERE name = ? AND path = ?",
         (name, path),
     ).fetchone()
     if row:
-        existing = dict(row)
         conn.close()
-        return existing
+        return dict(row)
 
-    project_id = str(uuid.uuid4())
+    pid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO projects (id, name, path, created_at) VALUES (?, ?, ?, ?)",
-        (project_id, name, path, now),
+        (pid, name, path, now),
     )
     conn.commit()
     conn.close()
-    return {"id": project_id, "name": name, "path": path, "created_at": now}
+    return {"id": pid, "name": name, "path": path, "created_at": now}
 
 
-def get_project(project_id: str) -> dict | None:
-    conn = _connect()
+def get_project(project_id):
+    conn = get_conn()
     row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def list_projects() -> list[dict]:
-    conn = _connect()
+def list_projects():
+    conn = get_conn()
     rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_project_by_name_path(name: str, path: str) -> dict | None:
-    """Return a project matching the given `name` AND `path`, or None."""
-    conn = _connect()
+def get_project_by_name_path(name, path):
+    conn = get_conn()
     row = conn.execute(
         "SELECT * FROM projects WHERE name = ? AND path = ?",
         (name, path),
@@ -222,20 +208,13 @@ def get_project_by_name_path(name: str, path: str) -> dict | None:
     return dict(row) if row else None
 
 
-# ── report helpers ───────────────────────────────────────────────
-
-def create_report(
-    project_id: str,
-    report_md: str = "",
-    analysis_json: str = "",
-    audit_raw: str = "",
-) -> dict:
-    report_id = str(uuid.uuid4())
+def create_report(project_id, report_md="", analysis_json="", audit_raw=""):
+    rid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    stats = _parse_analysis(analysis_json)
+    stats = parse_analysis(analysis_json)
 
-    conn = _connect()
+    conn = get_conn()
     conn.execute(
         """INSERT INTO reports
            (id, project_id, status, total_files, critical_issues, major_issues,
@@ -243,7 +222,7 @@ def create_report(
             audit_raw, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            report_id, project_id, "completed",
+            rid, project_id, "completed",
             stats["total_files"], stats["critical_issues"], stats["major_issues"],
             stats["minor_issues"], stats["average_score"], stats["severity"],
             report_md, analysis_json, audit_raw, now,
@@ -253,7 +232,7 @@ def create_report(
     conn.close()
 
     return {
-        "id": report_id,
+        "id": rid,
         "project_id": project_id,
         "status": "completed",
         "total_files": stats["total_files"],
@@ -266,17 +245,12 @@ def create_report(
     }
 
 
-def create_pending_report(
-    project_id: str,
-    analysis_json: str = "",
-    audit_raw: str = "",
-) -> dict:
-    report_id = str(uuid.uuid4())
+def create_pending_report(project_id, analysis_json="", audit_raw=""):
+    rid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    stats = parse_analysis(analysis_json)
 
-    stats = _parse_analysis(analysis_json)
-
-    conn = _connect()
+    conn = get_conn()
     conn.execute(
         """INSERT INTO reports
            (id, project_id, status, total_files, critical_issues, major_issues,
@@ -284,7 +258,7 @@ def create_pending_report(
             audit_raw, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            report_id, project_id, "awaiting_user_input",
+            rid, project_id, "awaiting_user_input",
             stats["total_files"], stats["critical_issues"], stats["major_issues"],
             stats["minor_issues"], stats["average_score"], stats["severity"],
             "", analysis_json, audit_raw, now,
@@ -294,7 +268,7 @@ def create_pending_report(
     conn.close()
 
     return {
-        "id": report_id,
+        "id": rid,
         "project_id": project_id,
         "status": "awaiting_user_input",
         "total_files": stats["total_files"],
@@ -307,12 +281,30 @@ def create_pending_report(
     }
 
 
-def finalize_report(report_id: str, report_md: str) -> dict | None:
-    conn = _connect()
-    conn.execute(
-        "UPDATE reports SET report_md = ?, status = 'completed' WHERE id = ?",
-        (report_md, report_id),
-    )
+def finalize_report(report_id, report_md, analysis_json="", audit_raw=""):
+    conn = get_conn()
+    if analysis_json:
+        stats = parse_analysis(analysis_json)
+        conn.execute(
+            """UPDATE reports
+               SET report_md = ?, status = 'completed',
+                   analysis_json = ?, audit_raw = ?,
+                   total_files = ?, critical_issues = ?, major_issues = ?,
+                   minor_issues = ?, average_score = ?, severity = ?
+               WHERE id = ?""",
+            (
+                report_md, analysis_json, audit_raw,
+                stats["total_files"], stats["critical_issues"],
+                stats["major_issues"], stats["minor_issues"],
+                stats["average_score"], stats["severity"],
+                report_id,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE reports SET report_md = ?, status = 'completed' WHERE id = ?",
+            (report_md, report_id),
+        )
     conn.commit()
     row = conn.execute(
         """SELECT id, project_id, status, total_files, critical_issues, major_issues,
@@ -324,20 +316,60 @@ def finalize_report(report_id: str, report_md: str) -> dict | None:
     return dict(row) if row else None
 
 
-def get_report(report_id: str) -> dict | None:
-    conn = _connect()
+def set_status(report_id, status, agent_output=None):
+    conn = get_conn()
+    if agent_output is not None:
+        conn.execute(
+            "UPDATE reports SET status = ?, agent_output = ? WHERE id = ?",
+            (status, agent_output, report_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE reports SET status = ? WHERE id = ?",
+            (status, report_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+update_report_status = set_status
+
+
+def create_hitl_report(project_id):
+    rid = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO reports
+           (id, project_id, status, total_files, critical_issues, major_issues,
+            minor_issues, average_score, severity, report_md, analysis_json,
+            audit_raw, agent_output, created_at)
+           VALUES (?, ?, ?, 0, 0, 0, 0, 0.0, 'minor', '', '', '', '', ?)""",
+        (rid, project_id, "processing", now),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "id": rid,
+        "project_id": project_id,
+        "status": "processing",
+        "created_at": now,
+    }
+
+
+def get_report(report_id):
+    conn = get_conn()
     row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
     conn.close()
     if not row:
         return None
     d = dict(row)
-    # parse analysis_json into structured files list for the UI
-    d["_parsed"] = _parse_analysis(d.get("analysis_json", "") or "")
+    d["_parsed"] = parse_analysis(d.get("analysis_json", "") or "")
     return d
 
 
-def list_reports_for_project(project_id: str) -> list[dict]:
-    conn = _connect()
+def list_reports_for_project(project_id):
+    conn = get_conn()
     rows = conn.execute(
         """SELECT id, project_id, status, total_files, critical_issues,
                   major_issues, minor_issues, average_score, severity, created_at
@@ -349,9 +381,8 @@ def list_reports_for_project(project_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_audit_history() -> list[dict]:
-    """Return every report with its project name — for the history list UI."""
-    conn = _connect()
+def get_audit_history():
+    conn = get_conn()
     rows = conn.execute(
         """SELECT r.id, p.name AS project_name, r.created_at AS audit_date,
                   r.status, r.total_files, r.critical_issues,
@@ -364,9 +395,8 @@ def get_audit_history() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_full_report(report_id: str) -> dict | None:
-    """Return the full structured report matching the UI's expected shape."""
-    conn = _connect()
+def get_full_report(report_id):
+    conn = get_conn()
     row = conn.execute(
         """SELECT r.*, p.name AS project_name
            FROM reports r
@@ -379,9 +409,8 @@ def get_full_report(report_id: str) -> dict | None:
         return None
 
     d = dict(row)
-    parsed = _parse_analysis(d.get("analysis_json", "") or "")
+    parsed = parse_analysis(d.get("analysis_json", "") or "")
 
-    # determine overall_health label
     if parsed["critical_issues"] >= parsed["major_issues"] and parsed["critical_issues"] >= parsed["minor_issues"]:
         health = "Critical – immediate remediation required"
     elif parsed["major_issues"] >= parsed["minor_issues"]:
