@@ -1,419 +1,577 @@
 import os
-import json
-from typing import Dict, List, Optional, Any
+import sys
+import re
+import argparse
+from typing import Dict, Optional, List
 from pathlib import Path
-from datetime import datetime
 from langsmith import Client, evaluate
-from langchain_openai import ChatOpenAI
+from langchain_community.llms import Ollama
 from document_freshness_auditor.crew import DocumentFreshnessAuditor
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ============================================================
-# CREW EXECUTION WITH DETAILED LOGGING
+# Command Line Arguments
 # ============================================================
 
-class CrewExecutionTracker:
-    """Track crew execution with detailed metrics"""
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Documentation Freshness Auditor - LLM Judge Evaluation"
+    )
     
-    def __init__(self):
-        self.execution_log = {
-            "start_time": None,
-            "end_time": None,
-            "agents": {},
-            "tasks": {},
-            "tools": {},
-            "errors": []
-        }
+    parser.add_argument(
+        "--project-path",
+        "-p",
+        type=str,
+        help="Path to demo/test project folder",
+        default=None
+    )
     
-    def log_agent_start(self, agent_name: str):
-        """Log when an agent starts"""
-        if agent_name not in self.execution_log["agents"]:
-            self.execution_log["agents"][agent_name] = {
-                "start_time": datetime.now().isoformat(),
-                "end_time": None,
-                "output": None,
-                "status": "running"
-            }
+    parser.add_argument(
+        "--model",
+        "-m",
+        type=str,
+        help="LLM model to use as judge (default: mistral:7b)",
+        default=os.getenv("OLLAMA_MODEL", "mistral:7b")
+    )
     
-    def log_agent_end(self, agent_name: str, output: str):
-        """Log when an agent finishes"""
-        if agent_name in self.execution_log["agents"]:
-            self.execution_log["agents"][agent_name]["end_time"] = datetime.now().isoformat()
-            self.execution_log["agents"][agent_name]["output"] = output[:500]  # First 500 chars
-            self.execution_log["agents"][agent_name]["status"] = "completed"
+    parser.add_argument(
+        "--ollama-url",
+        "-u",
+        type=str,
+        help="Ollama base URL (default: http://localhost:11434)",
+        default=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    )
     
-    def log_task_execution(self, task_name: str, agent_name: str, status: str):
-        """Log task execution"""
-        self.execution_log["tasks"][task_name] = {
-            "agent": agent_name,
-            "status": status,
-            "timestamp": datetime.now().isoformat()
-        }
+    parser.add_argument(
+        "--files",
+        "-f",
+        type=str,
+        nargs="+",
+        help="Specific files to audit (default: all)",
+        default=None
+    )
     
-    def log_tool_usage(self, tool_name: str, success: bool, error: Optional[str] = None):
-        """Log tool usage"""
-        if tool_name not in self.execution_log["tools"]:
-            self.execution_log["tools"][tool_name] = {
-                "calls": 0,
-                "successes": 0,
-                "failures": 0,
-                "error_log": []
-            }
-        
-        self.execution_log["tools"][tool_name]["calls"] += 1
-        
-        if success:
-            self.execution_log["tools"][tool_name]["successes"] += 1
-        else:
-            self.execution_log["tools"][tool_name]["failures"] += 1
-            if error:
-                self.execution_log["tools"][tool_name]["error_log"].append(error)
+    parser.add_argument(
+        "--experiment",
+        "-e",
+        type=str,
+        help="Experiment prefix for LangSmith",
+        default="doc-audit-llm-judge"
+    )
     
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get aggregated metrics"""
-        agents = self.execution_log["agents"]
-        tools = self.execution_log["tools"]
-        
-        # Calculate agent success rates
-        agent_metrics = {}
-        for agent_name, data in agents.items():
-            agent_metrics[agent_name] = {
-                "completed": data["status"] == "completed",
-                "had_output": bool(data["output"])
-            }
-        
-        # Calculate tool success rates
-        tool_metrics = {}
-        for tool_name, data in tools.items():
-            success_rate = (data["successes"] / data["calls"] * 100) if data["calls"] > 0 else 0
-            tool_metrics[tool_name] = {
-                "calls": data["calls"],
-                "success_rate": success_rate,
-                "failures": data["failures"]
-            }
-        
-        return {
-            "agents": agent_metrics,
-            "tools": tool_metrics,
-            "tasks": self.execution_log["tasks"]
-        }
-
-# Global tracker
-_tracker = CrewExecutionTracker()
-
-def run_crew_with_tracking(project_path: str, files_content: Dict) -> Dict:
-    """Run crew and track execution"""
-    global _tracker
-    _tracker = CrewExecutionTracker()
-    
-    try:
-        auditor = DocumentFreshnessAuditor()
-        crew = auditor.crew()
-        
-        # Log agents
-        for agent in crew.agents:
-            _tracker.log_agent_start(agent.role)
-        
-        # Run crew
-        result = crew.kickoff(inputs={
-            "project_path": project_path,
-            "files_content": files_content,
-        })
-        
-        # Log completion
-        for agent in crew.agents:
-            _tracker.log_agent_end(agent.role, str(result))
-        
-        return {
-            "output": str(result),
-            "metrics": _tracker.get_metrics()
-        }
-    
-    except Exception as e:
-        _tracker.execution_log["errors"].append(str(e))
-        return {
-            "output": f"Error: {e}",
-            "metrics": _tracker.get_metrics(),
-            "error": str(e)
-        }
+    return parser.parse_args()
 
 # ============================================================
-# AGENT-SPECIFIC EVALUATORS
+# Setup Demo Project Path
 # ============================================================
 
-class CrewAgentEvaluators:
-    """Evaluate individual agents in crew"""
+def get_demo_project_path(provided_path: Optional[str] = None) -> str:
+    """Get demo project path from argument or default"""
+    if provided_path:
+        path = Path(provided_path).resolve()
+        if not path.exists():
+            print(f"❌ Error: Path does not exist: {provided_path}")
+            sys.exit(1)
+        if not path.is_dir():
+            print(f"❌ Error: Path is not a directory: {provided_path}")
+            sys.exit(1)
+        print(f"✅ Using provided project path: {path}")
+        return str(path)
     
-    def __init__(self, judge_model: str = "gpt-oss-cloud", api_key: str = None):
-        self.judge = ChatOpenAI(
-            model_name=judge_model,
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            temperature=0.1
+    # Default path
+    default_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "src/document_freshness_auditor/demo-project"
+    )
+    
+    if not Path(default_path).exists():
+        print(f"⚠️  Default demo project not found: {default_path}")
+        print(f"\n💡 Provide a project path using:")
+        print(f"   uv run eval/eval_run.py --project-path /path/to/project")
+        sys.exit(1)
+    
+    print(f"✅ Using default project path: {default_path}")
+    return default_path
+
+# ============================================================
+# Initialize Judge LLM
+# ============================================================
+
+class JudgeLLM:
+    """Judge LLM for evaluating audit results"""
+    
+    def __init__(self, model: str, base_url: str):
+        """Initialize the judge with Ollama"""
+        self.base_url = base_url
+        self.model = model
+        
+        print(f"🔌 Connecting to Ollama...")
+        print(f"   Model: {self.model}")
+        print(f"   URL: {self.base_url}")
+        
+        self.judge = Ollama(
+            base_url=self.base_url,
+            model=self.model,
+            temperature=0.1,
+            top_k=40,
+            top_p=0.9,
         )
+        
+        # Test connection
+        try:
+            test = self.judge.invoke("Hello")
+            print(f"✅ Judge LLM connected successfully\n")
+        except Exception as e:
+            print(f"❌ Failed to connect to Ollama: {e}")
+            print(f"   Make sure Ollama is running:")
+            print(f"   ollama serve")
+            sys.exit(1)
+    
+    def evaluate(self, prompt: str) -> str:
+        """Call judge LLM with prompt"""
+        try:
+            response = self.judge.invoke(prompt)
+            return response
+        except Exception as e:
+            return f"Error: {str(e)}"
     
     def extract_score(self, response: str) -> float:
-        """Extract score from LLM response"""
-        import re
+        """Extract score 0-100 from LLM response"""
         try:
-            patterns = [r'score[:\s]+(\d+)', r'(\d+)\s*(?:/100|%)']
+            patterns = [
+                r'score[:\s]+(\d+)',
+                r'(\d+)\s*(?:/100|%)',
+                r'rating[:\s]+(\d+)',
+            ]
+            
             for pattern in patterns:
                 match = re.search(pattern, response.lower())
                 if match:
                     score = float(match.group(1))
                     return min(100, max(0, score)) / 100.0
+            
+            numbers = re.findall(r'\d+', response)
+            if numbers:
+                score = float(numbers[0])
+                return min(100, max(0, score)) / 100.0
         except:
             pass
+        
         return 0.5
-    
-    def evaluate_auditor_agent(self, run, example) -> Optional[Dict]:
-        """Evaluate: Documentation Auditor Agent
-        
-        Questions:
-        - Did it find all issues? (Recall)
-        - Did it find only real issues? (Precision)
-        - Did it classify severity correctly? (Accuracy)
-        """
-        output = str(run.outputs.get("output", ""))
-        metrics = run.outputs.get("metrics", {})
-        
-        expected_issues = example.outputs.get("total_issues", 22)
-        
-        prompt = f"""You are an expert evaluating a Documentation Auditor AI Agent.
 
-AGENT TASK: Scan code and documentation to find all freshness issues.
+# Global judge instance
+_judge = None
 
-GROUND TRUTH:
-- Expected to find: {expected_issues} total issues
-- Should classify as: Critical (3), Major (19), Minor (0)
-
-AGENT OUTPUT (excerpt):
-{output[:1000]}
-
-AGENT EXECUTION METRICS:
-{json.dumps(metrics, indent=2)}
-
-EVALUATE the agent on:
-1. RECALL: Did it find all {expected_issues} issues?
-   - 0-20: Found <25% of issues
-   - 20-40: Found 25-50% of issues
-   - 40-60: Found 50-75% of issues
-   - 60-80: Found 75-90% of issues
-   - 80-100: Found 90-100% of issues
-
-2. PRECISION: Did it avoid false positives?
-   - 0-20: Many hallucinated issues
-   - 20-40: Some false positives
-   - 40-60: Mostly accurate
-   - 60-80: Very accurate
-   - 80-100: No false positives
-
-3. ACCURACY: Correct severity classification?
-   - 0-20: Mostly wrong
-   - 20-40: Some correct
-   - 40-60: Moderate accuracy
-   - 60-80: Good accuracy
-   - 80-100: Perfect accuracy
-
-Overall Agent Quality Score (0-100):
-Respond with: "Score: [0-100]"
-"""
-        
-        print(f"   🤖 Evaluating Auditor Agent...")
-        response = self.judge.invoke(prompt)
-        score = self.extract_score(response.content if hasattr(response, 'content') else str(response))
-        
-        return {
-            "key": "auditor_agent_quality",
-            "score": score,
-            "comment": f"Auditor Agent: {score:.0%}"
-        }
-    
-    def evaluate_scorer_agent(self, run, example) -> Optional[Dict]:
-        """Evaluate: Freshness Scorer Agent
-        
-        Questions:
-        - Did it calculate freshness score correctly?
-        - Are effort estimates accurate?
-        """
-        output = str(run.outputs.get("output", ""))
-        
-        expected_freshness = 34  # From ground truth
-        expected_effort = 4.5  # hours
-        
-        prompt = f"""You are an expert evaluating a Freshness Scorer AI Agent.
-
-AGENT TASK: Calculate documentation freshness score and effort estimates.
-
-EXPECTED VALUES:
-- Freshness score: {expected_freshness}%
-- Effort to fix: {expected_effort} hours
-
-AGENT OUTPUT (excerpt):
-{output[:1000]}
-
-EVALUATE the agent on:
-1. SCORE ACCURACY: Is freshness score close to {expected_freshness}%?
-   - Allow ±10% variance
-   - Score: (100 - |actual - expected|) / 100
-
-2. EFFORT ESTIMATE ACCURACY: Is effort close to {expected_effort}h?
-   - Allow ±30% variance
-   - Score: (100 - |actual - expected| * 100 / expected) / 100
-
-3. REASONING QUALITY: Is reasoning clear and justified?
-   - Score: 0-100
-
-Overall Agent Quality (0-100):
-Respond with: "Score: [0-100]"
-"""
-        
-        print(f"   📊 Evaluating Scorer Agent...")
-        response = self.judge.invoke(prompt)
-        score = self.extract_score(response.content if hasattr(response, 'content') else str(response))
-        
-        return {
-            "key": "scorer_agent_quality",
-            "score": score,
-            "comment": f"Scorer Agent: {score:.0%}"
-        }
-    
-    def evaluate_fix_suggester_agent(self, run, example) -> Optional[Dict]:
-        """Evaluate: Fix Suggester Agent
-        
-        Questions:
-        - Are suggested fixes correct?
-        - Are diffs valid and applicable?
-        - Are suggestions actionable?
-        """
-        output = str(run.outputs.get("output", ""))
-        
-        prompt = f"""You are an expert evaluating a Fix Suggester AI Agent.
-
-AGENT TASK: Generate correct, actionable code fixes for all issues.
-
-CRITERIA:
-1. CORRECTNESS: Are diffs syntactically valid?
-2. APPLICABILITY: Can diffs be applied without errors?
-3. COMPLETENESS: Are all issues addressed?
-4. ACTIONABILITY: Can developers understand and implement fixes?
-5. QUALITY: Are fixes best-practice and well-documented?
-
-AGENT OUTPUT (excerpt):
-{output[:1000]}
-
-EVALUATE:
-1. Diff Validity (0-100): Are all diffs syntactically correct?
-2. Completeness (0-100): How many of ~22 issues are addressed?
-3. Actionability (0-100): Can developers easily apply fixes?
-4. Quality (0-100): Are fixes well-documented and best-practice?
-
-Overall Agent Quality (0-100):
-Respond with: "Score: [0-100]"
-"""
-        
-        print(f"   🔧 Evaluating Fix Suggester Agent...")
-        response = self.judge.invoke(prompt)
-        score = self.extract_score(response.content if hasattr(response, 'content') else str(response))
-        
-        return {
-            "key": "fixer_agent_quality",
-            "score": score,
-            "comment": f"Fix Suggester Agent: {score:.0%}"
-        }
+def get_judge(model: str = "mistral:7b", base_url: str = "http://localhost:11434") -> JudgeLLM:
+    """Get or create judge LLM instance"""
+    global _judge
+    if _judge is None:
+        _judge = JudgeLLM(model, base_url)
+    return _judge
 
 # ============================================================
-# TOOL EVALUATORS
+# Helper Functions
 # ============================================================
 
-def evaluate_tool_effectiveness(run, example) -> Optional[Dict]:
-    """Evaluate: How well tools were used by agents"""
-    metrics = run.outputs.get("metrics", {})
-    tools = metrics.get("tools", {})
+def safe_get_expected_issues(example) -> Dict[str, List[Dict]]:
+    """Safely extract expected issues from example"""
+    try:
+        expected_issues = example.outputs.get("expected_issues", {})
+        
+        if not isinstance(expected_issues, dict):
+            return {"critical": [], "major": [], "minor": []}
+        
+        result = {}
+        for severity in ["critical", "major", "minor"]:
+            issues = expected_issues.get(severity, [])
+            if isinstance(issues, list):
+                result[severity] = issues
+            else:
+                result[severity] = []
+        
+        return result
+    except Exception as e:
+        print(f"Error extracting issues: {e}")
+        return {"critical": [], "major": [], "minor": []}
+
+def get_files_from_project(project_path: str, file_filter: Optional[List[str]] = None) -> Dict[str, str]:
+    """Read all relevant files from project"""
+    files_content = {}
+    project_path = Path(project_path)
     
-    if not tools:
-        return {"key": "tool_effectiveness", "score": 0.5, "comment": "No tool metrics"}
+    # Extensions to include
+    extensions = {'.py', '.md', '.yaml', '.yml', '.txt', '.json'}
     
-    # Calculate average tool success rate
-    success_rates = []
-    for tool_name, data in tools.items():
-        success_rate = data.get("success_rate", 0)
-        success_rates.append(success_rate)
+    print(f"\n📄 Scanning project for files...")
     
-    avg_success = sum(success_rates) / len(success_rates) if success_rates else 0
-    score = avg_success / 100.0
+    for file_path in project_path.rglob('*'):
+        if not file_path.is_file():
+            continue
+        
+        # Skip common non-content files
+        if file_path.name.startswith('.'):
+            continue
+        if file_path.suffix not in extensions:
+            continue
+        if any(skip in str(file_path) for skip in ['__pycache__', '.git', '.venv', 'venv']):
+            continue
+        
+        # Get relative path
+        rel_path = file_path.relative_to(project_path)
+        
+        # Filter if specific files requested
+        if file_filter:
+            if str(rel_path) not in file_filter and file_path.name not in file_filter:
+                continue
+        
+        # Read file
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                files_content[str(rel_path)] = content
+                print(f"   ✓ {rel_path} ({len(content)} chars)")
+        except Exception as e:
+            print(f"   ✗ {rel_path} (Error: {str(e)[:30]})")
     
-    print(f"   🔨 Evaluating Tool Effectiveness...")
+    if not files_content:
+        print(f"❌ No files found in {project_path}")
+        sys.exit(1)
+    
+    return files_content
+
+# ============================================================
+# Evaluation Functions
+# ============================================================
+
+def correctness_evaluator(run, example) -> Optional[Dict]:
+    """Judge: Did agent find the expected issues?"""
+    judge = get_judge()
+    output = str(run.outputs.get("output", ""))
+    
+    if not output or len(output) < 10:
+        return {"key": "correctness", "score": 0.0, "comment": "Empty output"}
+    
+    expected_issues = safe_get_expected_issues(example)
+    expected_critical = len(expected_issues.get("critical", []))
+    expected_major = len(expected_issues.get("major", []))
+    expected_minor = len(expected_issues.get("minor", []))
+    total_expected = expected_critical + expected_major + expected_minor
+    
+    prompt = f"""You are an expert evaluator for documentation auditing.
+
+EXPECTED ISSUES TO FIND:
+- {expected_critical} critical issues
+- {expected_major} major issues  
+- {expected_minor} minor issues
+- Total: {total_expected} issues
+
+AUDIT OUTPUT:
+{output[:1000]}
+
+EVALUATE: Did the audit correctly identify the expected issues?
+
+Rate the CORRECTNESS on a scale of 0-100.
+
+Respond with: "Score: [0-100]" """
+
+    print(f"   📋 Evaluating correctness...")
+    response = judge.evaluate(prompt)
+    score = judge.extract_score(response)
     
     return {
-        "key": "tool_effectiveness",
+        "key": "correctness",
         "score": score,
-        "comment": f"Tool Success Rate: {score:.0%}"
+        "comment": f"Correctness: {score:.0%}"
+    }
+
+def hallucination_evaluator(run, example) -> Optional[Dict]:
+    """Judge: Are there fake/hallucinated issues?"""
+    judge = get_judge()
+    output = str(run.outputs.get("output", ""))
+    
+    if not output or len(output) < 10:
+        return {"key": "hallucination", "score": 1.0, "comment": "Empty output"}
+    
+    expected_issues = safe_get_expected_issues(example)
+    all_expected = []
+    for severity in ["critical", "major", "minor"]:
+        all_expected.extend(expected_issues.get(severity, []))
+    
+    issues_summary = "\n".join([f"- {issue.get('description', 'N/A')}" for issue in all_expected[:5]])
+    
+    prompt = f"""You are an expert evaluator for documentation auditing.
+
+VALID ISSUES IN PROJECT ({len(all_expected)} total):
+{issues_summary}
+
+AUDIT OUTPUT:
+{output[:1000]}
+
+EVALUATE: Did the audit HALLUCINATE or FABRICATE issues that don't exist?
+
+Rate ABSENCE OF HALLUCINATIONS on a scale of 0-100.
+
+Respond with: "Score: [0-100]" """
+
+    print(f"   🎭 Evaluating hallucinations...")
+    response = judge.evaluate(prompt)
+    score = judge.extract_score(response)
+    
+    return {
+        "key": "hallucination",
+        "score": score,
+        "comment": f"No hallucinations: {score:.0%}"
+    }
+
+def severity_evaluator(run, example) -> Optional[Dict]:
+    """Judge: Are severity levels correctly assigned?"""
+    judge = get_judge()
+    output = str(run.outputs.get("output", ""))
+    
+    if not output or len(output) < 10:
+        return {"key": "severity", "score": 0.5, "comment": "Empty output"}
+    
+    expected_issues = safe_get_expected_issues(example)
+    expected_critical = expected_issues.get("critical", [])
+    expected_major = expected_issues.get("major", [])
+    
+    critical_issues = "\n".join([f"- {i.get('description', 'N/A')}" for i in expected_critical[:2]])
+    major_issues = "\n".join([f"- {i.get('description', 'N/A')}" for i in expected_major[:3]])
+    
+    prompt = f"""You are an expert evaluator for documentation auditing.
+
+CRITICAL ISSUES (blocking, breaks functionality):
+{critical_issues if critical_issues else "None"}
+
+MAJOR ISSUES (misleading, causes problems):
+{major_issues if major_issues else "None"}
+
+AUDIT OUTPUT:
+{output[:1000]}
+
+EVALUATE: Did the audit correctly classify issues by severity?
+
+Rate SEVERITY ACCURACY on a scale of 0-100.
+
+Respond with: "Score: [0-100]" """
+
+    print(f"   ⚠️  Evaluating severity accuracy...")
+    response = judge.evaluate(prompt)
+    score = judge.extract_score(response)
+    
+    return {
+        "key": "severity",
+        "score": score,
+        "comment": f"Severity accuracy: {score:.0%}"
+    }
+
+def completeness_evaluator(run, example) -> Optional[Dict]:
+    """Judge: Is the audit report complete and well-structured?"""
+    judge = get_judge()
+    output = str(run.outputs.get("output", ""))
+    
+    if not output or len(output) < 10:
+        return {"key": "completeness", "score": 0.0, "comment": "Empty output"}
+    
+    expected_total = example.outputs.get("total_issues", 0)
+    
+    prompt = f"""You are an expert evaluator for documentation auditing.
+
+A comprehensive audit report should include:
+1. SUMMARY - Overview and total issues
+2. ISSUES LIST - Clear enumeration of all issues
+3. SEVERITY BREAKDOWN - Count by critical/major/minor
+4. FILE BREAKDOWN - Issues grouped by file
+
+EXPECTED: ~{expected_total} issues documented
+
+AUDIT OUTPUT:
+{output[:1500]}
+
+EVALUATE: Is the report complete and well-structured?
+
+Rate COMPLETENESS on a scale of 0-100.
+
+Respond with: "Score: [0-100]" """
+
+    print(f"   📊 Evaluating completeness...")
+    response = judge.evaluate(prompt)
+    score = judge.extract_score(response)
+    
+    return {
+        "key": "completeness",
+        "score": score,
+        "comment": f"Completeness: {score:.0%}"
+    }
+
+def actionability_evaluator(run, example) -> Optional[Dict]:
+    """Judge: Are the recommendations actionable?"""
+    judge = get_judge()
+    output = str(run.outputs.get("output", ""))
+    
+    if not output or len(output) < 10:
+        return {"key": "actionability", "score": 0.5, "comment": "Empty output"}
+    
+    prompt = f"""You are an expert evaluator for documentation auditing.
+
+An actionable report should:
+1. Clearly identify WHAT is wrong
+2. Explain WHY it's a problem  
+3. Show WHERE the issue is
+4. Provide HOW to fix it
+
+AUDIT OUTPUT:
+{output[:1500]}
+
+EVALUATE: Are recommendations ACTIONABLE? Can developers implement them?
+
+Rate ACTIONABILITY on a scale of 0-100.
+
+Respond with: "Score: [0-100]" """
+
+    print(f"   🎯 Evaluating actionability...")
+    response = judge.evaluate(prompt)
+    score = judge.extract_score(response)
+    
+    return {
+        "key": "actionability",
+        "score": score,
+        "comment": f"Actionability: {score:.0%}"
     }
 
 # ============================================================
-# MAIN EVALUATION
+# Crew Target
 # ============================================================
 
-def run_crew_agent_evaluation(project_path: str, judge_model: str = "gpt-oss-cloud"):
-    """Run complete crew agent evaluation"""
+def crew_target(inputs: dict) -> Dict:
+    """Run crew on project"""
+    try:
+        project_path = inputs.get("project_path", "")
+        files_content = inputs.get("files_content", {})
+        files_to_audit = inputs.get("files_to_audit", [])
+        
+        if not project_path or not Path(project_path).exists():
+            return {"output": f"Invalid path: {project_path}"}
+        
+        if not files_content:
+            return {"output": "No files provided"}
+        
+        os.environ["CREWAI_HUMAN_INPUT"] = "false"
+        
+        print(f"\n🔍 Running audit on {len(files_to_audit)} files...")
+        
+        auditor = DocumentFreshnessAuditor()
+        crew = auditor.crew()
+        
+        for task in crew.tasks:
+            if hasattr(task, 'human_input'):
+                task.human_input = False
+        
+        result = crew.kickoff(inputs={
+            "project_path": project_path,
+            "files_content": files_content,
+            "files_to_audit": files_to_audit
+        })
+        
+        return {"output": str(result) if result else "No output"}
     
+    except Exception as e:
+        import traceback
+        return {"output": f"Error: {str(e)}", "error": traceback.format_exc()[:100]}
+
+# ============================================================
+# Main Evaluation
+# ============================================================
+
+def run_evaluation(project_path: str, model: str, base_url: str, files_filter: Optional[List[str]], experiment: str):
+    """Run evaluation with given parameters"""
     print("=" * 70)
-    print("🚀 CrewAI Agent Performance Evaluation")
+    print("🚀 Documentation Freshness Auditor - LLM Judge Evaluation")
     print("=" * 70)
     
-    # Initialize evaluators
-    evaluators_obj = CrewAgentEvaluators(judge_model)
+    # Initialize judge
+    judge = get_judge(model, base_url)
     
-    # Load dataset
     client = Client()
-    dataset = client.read_dataset(dataset_name="Doc_Freshness_Ground_Truth")
+    dataset_name = "Doc_Freshness_Ground_Truth"
     
-    # Define evaluators
+    try:
+        dataset = client.read_dataset(dataset_name=dataset_name)
+        print(f"✅ Dataset: {dataset.example_count} example(s)\n")
+    except Exception as e:
+        print(f"❌ Dataset not found: {dataset_name}")
+        print(f"   Run: python eval/dataset.py --project-path {project_path}")
+        return
+    
     evaluators = [
-        evaluators_obj.evaluate_auditor_agent,
-        evaluators_obj.evaluate_scorer_agent,
-        evaluators_obj.evaluate_fix_suggester_agent,
-        evaluate_tool_effectiveness,
+        correctness_evaluator,
+        hallucination_evaluator,
+        severity_evaluator,
+        completeness_evaluator,
+        actionability_evaluator,
     ]
     
-    print(f"\n📊 Agent Evaluators:")
-    print(f"   1. 🤖 Auditor Agent (Recall, Precision, Accuracy)")
-    print(f"   2. 📊 Scorer Agent (Score accuracy, Effort accuracy)")
-    print(f"   3. 🔧 Fix Suggester Agent (Correctness, Actionability)")
-    print(f"   4. 🔨 Tool Effectiveness (Success rates)\n")
+    print(f"📊 Evaluation Metrics: {len(evaluators)} (LLM judge)")
+    for e in evaluators:
+        print(f"   • {e.__doc__}")
     
-    print(f"⏳ Running evaluation...\n")
+    print(f"\n📂 Project Path: {project_path}")
+    print(f"   Status: {'✅' if Path(project_path).exists() else '❌'}")
     
-    # Run evaluation
-    results = evaluate(
-        run_crew_with_tracking,
-        data=dataset,
-        evaluators=evaluators,
-        experiment_prefix="crew-agent-performance",
-        max_concurrency=1
-    )
+    # Read files from project
+    files_content = get_files_from_project(project_path, files_filter)
+    print(f"\n✅ Loaded {len(files_content)} files\n")
     
-    print("\n" + "=" * 70)
-    print("✅ Agent Evaluation Complete!")
-    print("=" * 70)
-    print("\n📊 Metrics Evaluated:")
-    print("   ✓ Auditor Agent Quality")
-    print("   ✓ Scorer Agent Quality")
-    print("   ✓ Fix Suggester Agent Quality")
-    print("   ✓ Tool Effectiveness")
-    print("\n📈 View on LangSmith: https://smith.langchain.com/\n")
+    print("⏳ Running evaluation with LLM judge...\n")
     
-    return results
+    try:
+        results = evaluate(
+            crew_target,
+            data=dataset_name,
+            evaluators=evaluators,
+            experiment_prefix=experiment,
+            max_concurrency=1
+        )
+        
+        print("\n" + "=" * 70)
+        print("✅ Evaluation Complete!")
+        print("=" * 70)
+        print("\n📊 View results: https://smith.langchain.com/")
+        print("=" * 70 + "\n")
+        
+        return results
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 if __name__ == "__main__":
-    import argparse
+    args = parse_arguments()
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--project-path", "-p", required=True)
-    parser.add_argument("--judge-model", "-m", default="gpt-oss-cloud")
-    args = parser.parse_args()
+    # Get project path
+    project_path = get_demo_project_path(args.project_path)
     
-    run_crew_agent_evaluation(args.project_path, args.judge_model)
+    print("\n" + "=" * 70)
+    print("📋 Configuration:")
+    print("=" * 70)
+    print(f"Project Path: {project_path}")
+    print(f"LLM Model: {args.model}")
+    print(f"Ollama URL: {args.ollama_url}")
+    if args.files:
+        print(f"Files Filter: {args.files}")
+    print(f"Experiment: {args.experiment}")
+    print("=" * 70 + "\n")
+    
+    run_evaluation(
+        project_path=project_path,
+        model=args.model,
+        base_url=args.ollama_url,
+        files_filter=args.files,
+        experiment=args.experiment
+    )
