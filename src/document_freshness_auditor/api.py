@@ -23,9 +23,9 @@ from document_freshness_auditor import hitl
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
-    hitl.install()
+    # hitl.install()  # HITL disabled
     yield
-    hitl.uninstall()
+    # hitl.uninstall()  # HITL disabled
 
 
 app = FastAPI(
@@ -209,7 +209,7 @@ def run_crew_background(report_id, project_path):
         hitl.link_report(report_id)
         auditor = DocumentFreshnessAuditor()
 
-        result = auditor.hitl_crew().kickoff(
+        result = auditor.crew().kickoff( #changed
             inputs={
                 "project_path": project_path,
                 "current_year": str(datetime.now().year),

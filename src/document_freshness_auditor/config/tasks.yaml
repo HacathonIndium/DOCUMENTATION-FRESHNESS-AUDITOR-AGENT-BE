@@ -262,4 +262,4 @@ suggestion_task:
     (target 1400-2200 words, approximately 10 minutes reading time).
     No project files are modified.
   agent: fix_suggester
-  human_input: true
+  # human_input: true
