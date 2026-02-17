@@ -17,7 +17,6 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 
 from document_freshness_auditor.crew import DocumentFreshnessAuditor
 from document_freshness_auditor import db
-from document_freshness_auditor import hitl
 
 
 @asynccontextmanager
@@ -206,10 +205,9 @@ def grab_outputs(result):
 
 def run_crew_background(report_id, project_path):
     try:
-        hitl.link_report(report_id)
         auditor = DocumentFreshnessAuditor()
 
-        result = auditor.crew().kickoff( #changed
+        result = auditor.crew().kickoff(
             inputs={
                 "project_path": project_path,
                 "current_year": str(datetime.now().year),
@@ -226,7 +224,6 @@ def run_crew_background(report_id, project_path):
 
         if not analysis_json:
             print(f"[API] WARNING: no structured analysis_json captured for {report_id}")
-            # Dump all task outputs for debugging
             if hasattr(result, "tasks_output") and result.tasks_output:
                 for i, t in enumerate(result.tasks_output):
                     r = (getattr(t, "raw", "") or "")
@@ -238,8 +235,8 @@ def run_crew_background(report_id, project_path):
     except Exception as e:
         print(f"[API] crew failed for report {report_id}: {e}")
         db.set_status(report_id, "failed")
-    finally:
-        hitl.remove(report_id)
+
+    return db.get_full_report(report_id)
 
 
 @app.post("/analyze/start")
@@ -250,74 +247,15 @@ def start_audit(req: AnalyzeRequest):
     project = db.create_project(name=req.project_name, path=req.project_path)
     report = db.create_hitl_report(project_id=project["id"])
 
-    t = threading.Thread(
-        target=run_crew_background,
-        args=(report["id"], req.project_path),
-        daemon=True,
-    )
-    t.start()
+    final_report = run_crew_background(report["id"], req.project_path)
 
-    return {
-        "report_id": report["id"],
-        "project_id": project["id"],
-        "status": "processing",
-        "message": "Audit started. Poll GET /hitl/status/{report_id} for progress.",
-    }
+    if not final_report:
+        raise HTTPException(status_code=500, detail="Audit failed; no report available")
+
+    return final_report
 
 
-@app.get("/hitl/status/{report_id}")
-def check_status(report_id: str):
-    report = db.get_report(report_id)
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    resp: dict[str, Any] = {
-        "report_id": report_id,
-        "status": report["status"],
-    }
-
-    if report["status"] == "pending_human_input":
-        resp["agent_output"] = report.get("agent_output", "")
-        resp["message"] = (
-            "The fix_suggester agent has produced a draft. "
-            "Review agent_output and POST /hitl/feedback with your feedback "
-            "(or empty string to approve as-is)."
-        )
-    elif report["status"] == "processing":
-        resp["message"] = "Crew is still running. Please poll again."
-    elif report["status"] == "completed":
-        resp["message"] = "Audit complete. Fetch full report at GET /reports/{report_id}."
-    elif report["status"] == "failed":
-        resp["message"] = "Crew run failed. Check server logs."
-
-    return resp
-
-
-@app.post("/hitl/feedback")
-def give_feedback(req: HITLFeedbackRequest):
-    report = db.get_report(req.report_id)
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    if report["status"] != "pending_human_input":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Report is not awaiting feedback (current status: {report['status']})",
-        )
-
-    ok = hitl.send_feedback(req.report_id, req.feedback)
-    if not ok:
-        raise HTTPException(
-            status_code=409,
-            detail="No pending HITL request found for this report (may have timed out).",
-        )
-
-    action = "approved as-is" if req.feedback.strip() == "" else "feedback submitted"
-    return {
-        "report_id": req.report_id,
-        "status": "processing",
-        "message": f"Human feedback {action}. Crew is resuming.",
-    }
+# HITL endpoints removed; analysis now returns completed report from /analyze/start
 
 
 @app.get("/history", response_model=list[AuditHistoryOut])
